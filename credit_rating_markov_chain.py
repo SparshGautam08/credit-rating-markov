@@ -6,6 +6,8 @@
 # probabilities. Part 2 uses the fundamental matrix of the absorbing chain for
 # the expected time to default. Part 3 simulates a bond portfolio by Monte
 # Carlo and checks the simulated defaults and losses against Parts 1 and 2.
+# Part 4 correlates the bonds through a one-factor Gaussian copula and compares
+# the loss tail with the independent case.
 import os
 import time
 import numpy as np
@@ -13,6 +15,8 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from numpy.polynomial.hermite_e import hermegauss
+from scipy.special import ndtr, ndtri
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLOT_DIR = os.path.join(HERE, "plots")
@@ -28,6 +32,11 @@ PORTFOLIO = {"AAA": 5, "AA": 10, "A": 25, "BBB": 30, "BB": 15, "B": 10, "CCC": 5
 FACE, RECOVERY = 1.0, 0.4     # $M; a default loses (1 - RECOVERY) of face
 YEARS = 5
 SIMS = 100_000
+
+# Part 4 asset correlations. The Basel II formula for corporate loans uses
+# 0.12 to 0.24, so 0.1 to 0.3 brackets realistic values; 0 is independence.
+RHOS = (0.0, 0.1, 0.2, 0.3)
+QUAD_NODES = 100              # Gauss-Hermite nodes for the exact one-year check
 
 
 # Reads P in the row convention x_{n+1} = x_n P used in credit risk, so
@@ -115,16 +124,16 @@ def simulate_default_times(P, n, rng):
     alive = np.ones(len(state), dtype=bool)
     while alive.any():
         idx = np.flatnonzero(alive)
-        state[idx] = step(state[idx], cum, rng)
+        state[idx] = step(state[idx], cum, rng.random(len(idx)))
         years[idx] += 1
         alive[idx] = state[idx] != d
     return years.reshape(d, n)
 
 
-# One year of rating moves: draw u ~ U(0, 1) and move to the first rating j
-# whose cumulative row probability exceeds u (inverse-CDF sampling)
-def step(state, cum, rng):
-    u = rng.random(len(state))
+# One year of rating moves: given u ~ U(0, 1), move to the first rating j
+# whose cumulative row probability exceeds u (inverse-CDF sampling). Columns
+# run from AAA to D, so a large u means a downgrade or default.
+def step(state, cum, u):
     nxt = np.empty_like(state)
     for s in np.unique(state):
         m = state == s
@@ -169,15 +178,27 @@ def part2(P, labels, powers, rng):
 
 # Simulates the ratings of every bond in every scenario for YEARS years and
 # returns the year each bond defaults (0 = no default within the horizon).
-# Bonds move independently of each other.
-def simulate_portfolio(P, start, sims, years, rng):
+# With rho = 0 the bonds move independently. Otherwise each year uses the
+# one-factor Gaussian copula: bond i's credit quality is
+#     X_i = sqrt(rho) Z + sqrt(1 - rho) eps_i,
+# where Z is the economy that year (shared by every bond in the scenario) and
+# eps_i is the bond's own news, all standard normal. Each X_i is still N(0, 1),
+# so u_i = Phi(-X_i) is still U(0, 1) and every bond's rating moves follow P
+# exactly as before. Only the dependence changes: a bad year (Z low) pushes
+# every u_i up, towards downgrades and default, at the same time.
+def simulate_portfolio(P, start, sims, years, rng, rho=0.0):
     d = len(P) - 1
     cum = np.cumsum(P, axis=1)
     state = np.tile(start, sims)
     default_year = np.zeros(len(state), dtype=np.int8)
     for y in range(1, years + 1):
+        if rho == 0:
+            u = rng.random(len(state))
+        else:
+            z = np.repeat(rng.standard_normal(sims), len(start))
+            u = ndtr(-(np.sqrt(rho) * z + np.sqrt(1 - rho) * rng.standard_normal(len(state))))
         alive = np.flatnonzero(state != d)
-        state[alive] = step(state[alive], cum, rng)
+        state[alive] = step(state[alive], cum, u[alive])
         default_year[alive[state[alive] == d]] = y
     return default_year.reshape(sims, len(start))
 
@@ -192,17 +213,22 @@ def default_count_pmf(p):
     return pmf
 
 
-# Loss quantile and expected shortfall (mean loss in the worst 1 - level)
+# Loss quantile (VaR) and expected shortfall, the mean loss over the worst
+# 1 - level of outcomes. Losses come in steps of one default, so the VaR level
+# usually falls inside a step; ES then counts only the part of that step that
+# lies in the tail, which keeps it from jumping when the step moves slightly.
 def var_es(losses, level):
     v = np.quantile(losses, level, method="inverted_cdf")
-    return v, losses[losses >= v].mean()
+    m = int(np.ceil(len(losses) * (1 - level)))
+    return v, np.sort(losses)[-m:].mean()
 
 
 def exact_var_es(pmf, lgd, level):
     cdf = np.cumsum(pmf)
     k = np.searchsorted(cdf, level)       # smallest k with P(K <= k) >= level
-    tail = np.arange(k, len(pmf))
-    return k * lgd, lgd * (pmf[tail] * tail).sum() / pmf[tail].sum()
+    above = np.arange(k + 1, len(pmf))
+    tail = (pmf[above] * above).sum() + k * (cdf[k] - level)
+    return k * lgd, lgd * tail / (1 - level)
 
 
 def part3(P, labels, powers, rng):
@@ -255,6 +281,87 @@ def part3(P, labels, powers, rng):
     contrib = pd.Series(lgd * p, index=[labels[s] for s in start]).groupby(level=0, sort=False).sum()
     print(f"Expected loss by rating ($M): {contrib.round(3).to_dict()}\n")
     return count, pmf, lgd
+
+
+# ---------------------------------------------------------------- Part 4
+
+# Exact one-year distribution of the number of defaults under the copula.
+# Bond i defaults in the year when X_i < Phi^-1(p_i). Given the economy Z = z
+# the bonds are independent, each defaulting with probability
+#     p_i(z) = Phi((Phi^-1(p_i) - sqrt(rho) z) / sqrt(1 - rho)),
+# so the conditional pmf is a Poisson binomial, and the unconditional pmf
+# averages it over z ~ N(0, 1) by Gauss-Hermite quadrature. Over several years
+# ratings also migrate, the defaults depend on the whole path of Z, and there
+# is no such formula, which is why the 5-year results need Monte Carlo.
+def exact_one_year_pmf(p, rho):
+    z, w = hermegauss(QUAD_NODES)
+    w = w / w.sum()
+    pmf = np.zeros(len(p) + 1)
+    for zk, wk in zip(z, w):
+        pmf += wk * default_count_pmf(ndtr((ndtri(p) - np.sqrt(rho) * zk) / np.sqrt(1 - rho)))
+    return pmf
+
+
+# Distribution-free 95% CI for a quantile from the order statistics: the
+# number of draws below the true q-quantile is Binomial(n, q)
+def quantile_ci(x, q):
+    xs = np.sort(x)
+    n = len(xs)
+    half = 1.96 * np.sqrt(n * q * (1 - q))
+    return xs[int(np.floor(n * q - half))], xs[min(int(np.ceil(n * q + half)), n - 1)]
+
+
+def part4(P, labels, powers, rng):
+    d = len(labels) - 1
+    start = np.concatenate([[labels.index(r)] * n for r, n in PORTFOLIO.items()])
+    lgd = FACE * (1 - RECOVERY)
+    p1 = 1 - np.cumsum(P, axis=1)[start, d - 1]   # one-year default probability, as step() sees it
+    el_exact = lgd * powers[YEARS][start, d].sum()
+    print(f"Part 4: correlated defaults through a one-factor Gaussian copula ({SIMS:,} scenarios each)")
+
+    rows, check, losses = [], [], {}
+    for rho in RHOS:
+        t0 = time.perf_counter()
+        default_year = simulate_portfolio(P, start, SIMS, YEARS, rng, rho)
+        elapsed = time.perf_counter() - t0
+        loss = losses[rho] = (default_year > 0).sum(axis=1) * lgd
+        se = loss.std(ddof=1) / np.sqrt(SIMS)
+        v99, es99 = var_es(loss, 0.99)
+        v999, es999 = var_es(loss, 0.999)
+        lo, hi = quantile_ci(loss, 0.999)
+        rows.append({"rho": rho, "Expected loss": loss.mean(), "EL z": (loss.mean() - el_exact) / se,
+                     "SD": loss.std(ddof=1), "VaR 99%": v99, "ES 99%": es99, "VaR 99.9%": v999,
+                     "VaR 99.9% CI": f"{lo:.1f} to {hi:.1f}", "ES 99.9%": es999,
+                     "P(loss > 10)": np.mean(loss > 10), "P(no loss)": np.mean(loss == 0),
+                     "Time (s)": elapsed})
+
+        # Check against the exact one-year distribution, using year-1 defaults
+        loss1 = (default_year == 1).sum(axis=1) * lgd
+        pmf = exact_one_year_pmf(p1, rho) if rho > 0 else default_count_pmf(p1)
+        for level in (0.99, 0.999):
+            v, es = var_es(loss1, level)
+            ve, ese = exact_var_es(pmf, lgd, level)
+            lo, hi = quantile_ci(loss1, level)
+            check.append({"rho": rho, "Level": f"{level:.1%}", "MC VaR": v, "MC VaR CI": f"{lo:.1f} to {hi:.1f}",
+                          "Exact VaR": ve, "Exact P(L <= VaR)": pmf[:int(round(ve / lgd)) + 1].sum(),
+                          "MC ES": es, "Exact ES": ese})
+        check[-1]["MC mean"] = loss1.mean()
+        check[-1]["Exact mean"] = lgd * (np.arange(len(pmf)) * pmf).sum()
+
+    df = pd.DataFrame(rows)
+    print(f"Loss over {YEARS} years ($M). Exact expected loss {el_exact:.3f} at every rho, since the "
+          "copula leaves each bond's own rating moves unchanged")
+    print(df.to_string(index=False, float_format="{:.3f}".format,
+                       formatters={"rho": "{:.1f}".format, "EL z": "{:+.2f}".format,
+                                   "P(loss > 10)": "{:.4f}".format, "P(no loss)": "{:.4f}".format,
+                                   "Time (s)": "{:.1f}".format}) + "\n")
+    print("Check: one-year loss ($M), Monte Carlo against the exact copula distribution (quadrature).")
+    print("Losses come in $0.6M steps, so when the exact P(L <= VaR) is within Monte Carlo noise of the level,")
+    print("the simulated VaR can land one step either side; the order-statistic CI shows when that can happen.")
+    print(pd.DataFrame(check).to_string(index=False, float_format="{:.3f}".format,
+                                        formatters={"rho": "{:.1f}".format, "Exact P(L <= VaR)": "{:.5f}".format},
+                                        na_rep="") + "\n")
+    return df, losses, el_exact
 
 
 # ---------------------------------------------------------------- Plots
@@ -329,6 +436,31 @@ def plot_results(P, labels, powers, t, years, count, pmf, lgd):
     plt.close("all")
 
 
+def plot_correlated(df, losses, el_exact, lgd):
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+    for rho, loss in losses.items():
+        k = np.bincount(np.round(loss / lgd).astype(int))
+        x = np.arange(len(k)) * lgd
+        axes[0].semilogy(x[k > 0], k[k > 0] / len(loss), "o-", ms=2, lw=1, label=rf"$\rho$ = {rho:.1f}")
+    axes[0].set_xlabel(f"Loss over {YEARS} years ($M)")
+    axes[0].set_ylabel("Probability")
+    axes[0].set_title("Loss distribution: correlation fattens the tail")
+    axes[0].legend(fontsize=8)
+    rho = df["rho"]
+    for col, mk in (("VaR 99%", "s--"), ("VaR 99.9%", "o-"), ("ES 99.9%", "^-")):
+        axes[1].plot(rho, df[col], mk, label=col)
+    axes[1].plot(rho, df["Expected loss"], "k:", label="Expected loss")
+    axes[1].axhline(el_exact, color="gray", lw=0.5)
+    axes[1].set_xticks(rho)
+    axes[1].set_xlabel(r"Asset correlation $\rho$")
+    axes[1].set_ylabel("Loss ($M)")
+    axes[1].set_title("Tail risk grows with correlation; expected loss doesn't")
+    axes[1].legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(os.path.join(PLOT_DIR, "credit_correlated_losses.png"), dpi=150)
+    plt.close("all")
+
+
 if __name__ == "__main__":
     pd.set_option("display.width", 160)
     rng = np.random.default_rng(seed=42)
@@ -336,5 +468,7 @@ if __name__ == "__main__":
     P, powers = part1(P_raw, labels)
     t, years = part2(P, labels, powers, rng)
     count, pmf, lgd = part3(P, labels, powers, rng)
+    df, losses, el_exact = part4(P, labels, powers, rng)
     plot_results(P, labels, powers, t, years, count, pmf, lgd)
+    plot_correlated(df, losses, el_exact, lgd)
     print(f"Plots saved to {PLOT_DIR}")
